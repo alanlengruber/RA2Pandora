@@ -1,0 +1,11 @@
+# Conquistas do RetroAchievements na Pandora.
+#
+# Para ligar: copie este arquivo para "conta.cfg" (na mesma pasta) e troque
+# o usuario e a senha pelos seus. Precisa do cabo CP2102 ligado ao Raspberry
+# Pi com o ra-relay-pi rodando.
+#
+# Atencao: a senha fica em texto puro no pendrive.
+
+cheevos_enable = "true"
+cheevos_username = "seu_usuario"
+cheevos_password = "sua_senha"

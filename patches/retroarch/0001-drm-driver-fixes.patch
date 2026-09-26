@@ -1,0 +1,445 @@
+diff --git a/gfx/drivers/drm_gfx.c b/gfx/drivers/drm_gfx.c
+index 9195d77..3d0046b 100644
+--- a/gfx/drivers/drm_gfx.c
++++ b/gfx/drivers/drm_gfx.c
+@@ -22,6 +22,7 @@
+ #include <libdrm/drm_fourcc.h>
+ #include <fcntl.h>
+ #include <sys/mman.h>
++#include <poll.h>
+ 
+ #include <compat/strl.h>
+ #include <rthreads/rthreads.h>
+@@ -35,11 +36,13 @@
+ #include "../../menu/menu_driver.h"
+ #endif
+ 
++#include "../../configuration.h"
+ #include "../../retroarch.h"
+ #include "../../verbosity.h"
+ #include "../common/drm_common.h"
+ 
+ #include "drm_pixformats.h"
++#include "../drivers_font_renderer/bitmap.h"
+ 
+ struct modeset_buf
+ {
+@@ -109,7 +112,8 @@ struct drm_surface
+    int total_pitch;
+ 
+    float aspect;
+-   bool flip_page;
++   /* Page to draw the next frame into. */
++   unsigned int flip_page;
+ };
+ 
+ struct drm_struct
+@@ -127,6 +131,9 @@ struct drm_struct
+ 
+    drmModeEncoder *encoder;
+    drmModeRes *resources;
++
++   /* Rotation requested by the core, in 90 degree counter-clockwise steps. */
++   unsigned rotation;
+ } drm;
+ 
+ struct drm_video
+@@ -158,6 +165,7 @@ struct drm_video
+    int core_width;
+    int core_height;
+    int core_pitch;
++   unsigned core_rotation;
+    /* Both main and menu surfaces are going to have the same aspect,
+     * so we keep it here for future reference. */
+    float current_aspect;
+@@ -270,6 +278,36 @@ static void drm_surface_setup(void *data,  int src_width, int src_height,
+    surface->flip_page = 0;
+ }
+ 
++/* Page flips are non-blocking: a blocking atomic commit on the Rockchip
++ * 4.4 kernel only returns two vblanks later, halving the frame rate.
++ * We only wait for the previous flip before queueing the next one. */
++static bool drm_flip_pending = false;
++
++static void drm_flip_handler(int fd, unsigned frame,
++      unsigned sec, unsigned usec, void *data)
++{
++   drm_flip_pending = false;
++}
++
++static void drm_wait_pending_flip(void)
++{
++   drmEventContext evctx = {0};
++   evctx.version           = 2;
++   evctx.page_flip_handler = drm_flip_handler;
++
++   while (drm_flip_pending)
++   {
++      struct pollfd pfd = { drm.fd, POLLIN, 0 };
++      /* Never hang on a lost event. */
++      if (poll(&pfd, 1, 100) <= 0)
++      {
++         drm_flip_pending = false;
++         break;
++      }
++      drmHandleEvent(drm.fd, &evctx);
++   }
++}
++
+ static void drm_page_flip(struct drm_surface *surface)
+ {
+    /* We already have the id of the FB_ID property of
+@@ -290,24 +328,166 @@ static void drm_page_flip(struct drm_surface *surface)
+       RARCH_ERR("[DRM] Failed to add atomic property for pageflip.\n");
+    }
+    /*... now we just need to do the commit */
++   drm_wait_pending_flip();
+ 
+    /* REMEMBER!!! The DRM_MODE_PAGE_FLIP_EVENT flag asks the kernel
+     * to send you an event to the drm.fd once the
+     * pageflip is complete. If you don't want -12 errors
+     * (ENOMEM), namely "Cannot allocate memory", then
+     * you must drain the event queue of that fd. */
+-   if (drmModeAtomicCommit(drm.fd, req, 0, NULL) < 0)
++   if (drmModeAtomicCommit(drm.fd, req,
++         DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, NULL) < 0)
+    {
+       RARCH_ERR("[DRM] Failed to commit for pageflip.\n");
+    }
++   else
++      drm_flip_pending = true;
+ 
+-   surface->flip_page = !(surface->flip_page);
++   /* The next frame goes into a page that is neither on screen
++    * nor waiting to be flipped. */
++   surface->flip_page = (surface->flip_page + 1) % surface->numpages;
+ 
+    drmModeAtomicFree(req);
+ }
+ 
++/* On-screen text (RetroArch notifications, such as achievement unlocks):
++ * this driver has no font renderer or widgets, so messages are drawn with
++ * the bitmap font on a black band at the top or bottom of the frame. */
++#define DRM_MSG_MAX_LINES 4
++#define DRM_MSG_MAX_COLS  96
++
++static bitmapfont_lut_t *drm_font = NULL;
++
++static void drm_put_pixel(struct modeset_buf *buf, unsigned bpp,
++      int x, int y, bool on)
++{
++   uint8_t *row = buf->map + y * buf->stride;
++
++   if (bpp == 4)
++      ((uint32_t*)row)[x] = on ? 0x00FFFFFF : 0;
++   else
++      ((uint16_t*)row)[x] = on ? 0xFFFF : 0;
++}
++
++/* UTF-8 to plain ASCII: the bitmap font only has ASCII. Accented Latin
++ * letters lose the accent, anything else becomes '?'. */
++static void drm_msg_to_ascii(const char *in, char *out, size_t size)
++{
++   static const char latin1[] =
++      "AAAAAAACEEEEIIII" "DNOOOOOxOUUUUYPs"  /* U+00C0..U+00DF */
++      "aaaaaaaceeeeiiii" "dnooooo/ouuuuypy"; /* U+00E0..U+00FF */
++   const unsigned char *p = (const unsigned char*)in;
++   size_t n = 0;
++
++   while (*p && n + 1 < size)
++   {
++      unsigned c = *p++;
++
++      if (c < 0x80)
++         out[n++] = (c < 0x20) ? ' ' : (char)c;
++      else if ((c & 0xE0) == 0xC0 && (*p & 0xC0) == 0x80)
++      {
++         unsigned cp = ((c & 0x1F) << 6) | (*p++ & 0x3F);
++         out[n++] = (cp >= 0xC0 && cp <= 0xFF) ? latin1[cp - 0xC0] : '?';
++      }
++      else
++      {
++         /* Longer sequence: skip its continuation bytes. */
++         while ((*p & 0xC0) == 0x80)
++            p++;
++         out[n++] = '?';
++      }
++   }
++   out[n] = '\0';
++}
++
++static void drm_draw_msg(struct drm_surface *surface, const char *msg)
++{
++   struct modeset_buf *buf = &surface->pages[surface->flip_page].buf;
++   int w = surface->src_width, h = surface->src_height;
++   int cols = (w - 4) / FONT_WIDTH_STRIDE;
++   char text[512], lines[DRM_MSG_MAX_LINES][DRM_MSG_MAX_COLS + 1];
++   int nlines = 0, len = 0, i, band_h, y0;
++   char *word, *save = NULL;
++
++   if (!msg || !*msg || cols < 4)
++      return;
++   if (cols > DRM_MSG_MAX_COLS)
++      cols = DRM_MSG_MAX_COLS;
++   if (!drm_font && !(drm_font = bitmapfont_get_lut()))
++      return;
++
++   /* Word wrap into at most DRM_MSG_MAX_LINES lines; a word longer than a
++    * whole line is split. */
++   drm_msg_to_ascii(msg, text, sizeof(text));
++   lines[0][0] = '\0';
++   for (word = strtok_r(text, " ", &save); word; word = strtok_r(NULL, " ", &save))
++   {
++      int wlen = (int)strlen(word);
++
++      while (wlen > 0 && nlines < DRM_MSG_MAX_LINES)
++      {
++         int take;
++
++         if (len > 0 && len + 1 + wlen > cols)
++         {
++            /* Does not fit after the current text: next line. */
++            if (++nlines < DRM_MSG_MAX_LINES)
++               lines[nlines][0] = '\0';
++            len = 0;
++            continue;
++         }
++         if (len > 0)
++            lines[nlines][len++] = ' ';
++         take = wlen < cols ? wlen : cols;
++         memcpy(lines[nlines] + len, word, take);
++         len += take;
++         lines[nlines][len] = '\0';
++         word += take;
++         wlen -= take;
++      }
++   }
++   if (nlines < DRM_MSG_MAX_LINES && len > 0)
++      nlines++;
++   if (!nlines)
++      return;
++
++   /* Band at the top or the bottom of the frame, following RetroArch's
++    * message position (video_message_pos_y, measured from the bottom). */
++   band_h = nlines * FONT_HEIGHT_STRIDE + 3;
++   if (band_h > h)
++      return;
++   y0 = (config_get_ptr()->floats.video_msg_pos_y >= 0.5f) ? 0 : h - band_h;
++
++   for (i = y0; i < y0 + band_h; i++)
++   {
++      int x;
++      for (x = 0; x < w; x++)
++         drm_put_pixel(buf, surface->bpp, x, i, false);
++   }
++
++   for (i = 0; i < nlines; i++)
++   {
++      int n  = (int)strlen(lines[i]);
++      int x0 = (w - n * FONT_WIDTH_STRIDE) / 2;
++      int ly = y0 + 2 + i * FONT_HEIGHT_STRIDE;
++      int k, gx, gy;
++
++      for (k = 0; k < n; k++)
++      {
++         const bool *glyph = drm_font->lut[(unsigned char)lines[i][k]];
++
++         for (gy = 0; gy < FONT_HEIGHT; gy++)
++            for (gx = 0; gx < FONT_WIDTH; gx++)
++               if (glyph[gx + gy * FONT_WIDTH])
++                  drm_put_pixel(buf, surface->bpp,
++                        x0 + k * FONT_WIDTH_STRIDE + gx, ly + gy, true);
++      }
++   }
++}
++
+ static void drm_surface_update(void *data, const void *frame,
+-      struct drm_surface *surface)
++      struct drm_surface *surface, const char *msg)
+ {
+    struct drm_video *_drmvars  = data;
+    struct drm_page       *page = NULL;
+@@ -326,6 +506,8 @@ static void drm_surface_update(void *data, const void *frame,
+       dst_offset += surface->pitch;
+    }
+ 
++   drm_draw_msg(surface, msg);
++
+    /* Page flipping */
+    drm_page_flip(surface);
+ }
+@@ -425,6 +607,9 @@ static void drm_plane_setup(struct drm_surface *surface)
+    int i,j;
+    char fmt_name[5];
+ 
++   /* Changing the plane while a flip is queued fails with EBUSY. */
++   drm_wait_pending_flip();
++
+    /* Get plane resources */
+    drmModePlane *plane;
+    drmModePlaneRes *plane_resources;
+@@ -517,6 +702,15 @@ static void drm_plane_setup(struct drm_surface *surface)
+    uint32_t plane_flags = 0;
+    uint32_t plane_w = drm.current_mode->vdisplay * surface->aspect;
+    uint32_t plane_h = drm.current_mode->vdisplay;
++   /* "Full" aspect ratio: fill the whole mode. Needed on low-res CRT modes
++    * (e.g. 384x224) whose pixels are not square. */
++   if (config_get_ptr()->uints.video_aspect_ratio_idx == ASPECT_RATIO_FULL)
++   {
++      plane_w = drm.current_mode->hdisplay;
++      /* A vertical (3:4) game on a 4:3 screen uses 9/16 of the width. */
++      if (drm.rotation & 1)
++         plane_w = drm.current_mode->hdisplay * 9 / 16;
++   }
+    /* If we obtain a scaled image width that is bigger than the physical screen width,
+     * then we keep the physical screen width as our maximum width. */
+    if (plane_w > drm.current_mode->hdisplay)
+@@ -741,6 +935,39 @@ static void *drm_init(const video_info_t *video,
+    return _drmvars;
+ }
+ 
++/* Copies a core frame into a page rotated by rot * 90 degrees
++ * counter-clockwise (the libretro convention). w, h and pitch
++ * describe the source frame. */
++static void drm_blit_rotated(struct modeset_buf *dst, const uint8_t *src,
++      unsigned w, unsigned h, unsigned pitch, unsigned bpp, unsigned rot)
++{
++   unsigned x, y;
++   unsigned dw = (rot & 1) ? h : w;
++   unsigned dh = (rot & 1) ? w : h;
++
++   for (y = 0; y < dh; y++)
++   {
++      uint8_t *d = dst->map + y * dst->stride;
++
++      for (x = 0; x < dw; x++)
++      {
++         unsigned sx, sy;
++
++         switch (rot)
++         {
++            case 1:  sx = w - 1 - y; sy = x;         break;
++            case 2:  sx = w - 1 - x; sy = h - 1 - y; break;
++            default: sx = y;         sy = h - 1 - x; break;
++         }
++
++         if (bpp == 4)
++            ((uint32_t*)d)[x] = *(const uint32_t*)(src + sy * pitch + sx * 4);
++         else
++            ((uint16_t*)d)[x] = *(const uint16_t*)(src + sy * pitch + sx * 2);
++      }
++   }
++}
++
+ static bool drm_frame(void *data, const void *frame, unsigned width,
+       unsigned height, uint64_t frame_count, unsigned pitch, const char *msg,
+       video_frame_info_t *video_info)
+@@ -750,25 +977,31 @@ static bool drm_frame(void *data, const void *frame, unsigned width,
+    bool menu_is_alive         = (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE) ? true : false;
+ #endif
+ 
++   unsigned rot = drm.rotation;
++   unsigned bpp = _drmvars->rgb32 ? 4 : 2;
++
+    if (   (width  != _drmvars->core_width)
+-       || (height != _drmvars->core_height))
++       || (height != _drmvars->core_height)
++       || (rot    != _drmvars->core_rotation))
+    {
+       /* Sanity check. */
+       if (width == 0 || height == 0)
+          return true;
+ 
+-      _drmvars->core_width  = width;
+-      _drmvars->core_height = height;
+-      _drmvars->core_pitch  = pitch;
++      _drmvars->core_width    = width;
++      _drmvars->core_height   = height;
++      _drmvars->core_pitch    = pitch;
++      _drmvars->core_rotation = rot;
+ 
+       if (_drmvars->main_surface)
+          drm_surface_free(_drmvars, &_drmvars->main_surface);
+ 
+-      /* We need to recreate the main surface and it's pages (buffers). */
++      /* We need to recreate the main surface and it's pages (buffers).
++       * A 90/270 degree rotation swaps its dimensions. */
+       drm_surface_setup(_drmvars,
+-            width,
+-            height,
+-            pitch,
++            (rot & 1) ? height : width,
++            (rot & 1) ? width  : height,
++            rot ? ((rot & 1) ? height : width) * bpp : pitch,
+             _drmvars->rgb32 ? 4 : 2,
+             _drmvars->rgb32 ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_RGB565,
+             255,
+@@ -785,8 +1018,22 @@ static bool drm_frame(void *data, const void *frame, unsigned width,
+    menu_driver_frame(menu_is_alive, video_info);
+ #endif
+ 
++   /* A NULL frame is a dupe: keep showing the current page. */
++   if (!frame)
++      return true;
++
++   if (rot)
++   {
++      struct drm_surface *surface = _drmvars->main_surface;
++      drm_blit_rotated(&surface->pages[surface->flip_page].buf,
++            (const uint8_t*)frame, width, height, pitch, bpp, rot);
++      drm_draw_msg(surface, msg);
++      drm_page_flip(surface);
++      return true;
++   }
++
+    /* Update main surface: locate free page, blit and flip. */
+-   drm_surface_update(_drmvars, frame, _drmvars->main_surface);
++   drm_surface_update(_drmvars, frame, _drmvars->main_surface, msg);
+    return true;
+ }
+ 
+@@ -865,7 +1112,7 @@ static void drm_set_texture_frame(void *data, const void *frame, bool rgb32,
+    }
+ 
+    /* We update the menu surface if menu is active. */
+-   drm_surface_update(_drmvars, frame_output, _drmvars->menu_surface);
++   drm_surface_update(_drmvars, frame_output, _drmvars->menu_surface, NULL);
+ }
+ 
+ static void drm_set_nonblock_state(void *a, bool b, bool c, unsigned d) { }
+@@ -953,6 +1200,12 @@ static void drm_gfx_free(void *data)
+    if (_drmvars->menu_surface)
+       drm_surface_free(_drmvars, &_drmvars->menu_surface);
+ 
++   if (drm_font)
++   {
++      bitmapfont_free_lut(drm_font);
++      drm_font = NULL;
++   }
++
+    /* Destroy mutexes and conditions. */
+    slock_free(_drmvars->pending_mutex);
+    slock_free(_drmvars->vsync_cond_mutex);
+@@ -963,6 +1216,13 @@ static void drm_gfx_free(void *data)
+    free(_drmvars);
+ }
+ 
++static void drm_set_rotation(void *data, unsigned rotation)
++{
++   (void)data;
++   /* Picked up by drm_frame(), which rebuilds the surface. */
++   drm.rotation = rotation % 4;
++}
++
+ video_driver_t video_drm = {
+    drm_init,
+    drm_frame,
+@@ -975,7 +1235,7 @@ video_driver_t video_drm = {
+    drm_gfx_free,
+    "drm",
+    NULL, /* set_viewport */
+-   NULL, /* set_rotation */
++   drm_set_rotation,
+    drm_viewport_info,
+    NULL, /* read_viewport */
+    NULL, /* read_frame_raw */

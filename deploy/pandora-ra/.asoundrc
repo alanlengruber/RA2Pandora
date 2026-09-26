@@ -1,0 +1,24 @@
+# Dispositivo de audio do RetroArch novo. O codec da placa (rk312x) anuncia
+# S32_LE mas so reproduz certo em S16_LE: em 32 bits o som sai na metade da
+# velocidade e distorcido. Aqui forcamos 16 bits e mantemos o controle de
+# volume da placa ("Master Playback Volume", o mesmo do /etc/asound.conf).
+pcm.pandora {
+	type plug
+	slave {
+		pcm "pandora_volume"
+		format S16_LE
+		rate 44100
+	}
+}
+
+pcm.pandora_volume {
+	type softvol
+	slave.pcm "hw:0,0"
+	control {
+		name "Master Playback Volume"
+		card 0
+	}
+	min_dB -40.0
+	max_dB 6.0
+	resolution 100
+}

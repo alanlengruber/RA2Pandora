@@ -1,0 +1,37 @@
+# Ambiente de compilacao (scripts/preparar-ambiente.sh)
+toolchain/
+sysroot/
+src/
+build/
+out/
+
+# Pacote para o pendrive (scripts/montar-pacote.sh)
+pacote/
+
+# Logs trazidos da placa
+logs/
+
+# Gerados a partir das ROMs, do pandory.xml e do sistema de cada placa
+data/
+deploy/pandory/
+deploy/pandora-ra/retroarch.cfg
+deploy/pandora-ra/jogos.txt
+deploy/pandora-ra/verticais.txt
+deploy/roms_pandory/conquistas/
+
+# Copias locais (os originais ficam em out/ e tools/)
+deploy/pandora-ra/retroarch
+deploy/pandora-ra/pandora-coin
+deploy/pandora-ra/pandora-relay
+deploy/pandora-ra/cores/
+deploy/pandora-ra/raspberry-pi/
+
+# Testes de desenvolvimento
+deploy/pandora-ra/sons/
+deploy/roms_pandory/scripts/TesteRetroArch.sh
+
+# Login do RetroAchievements (nunca versionar)
+conta.cfg
+
+# Caches do Python
+__pycache__/
