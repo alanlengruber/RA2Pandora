@@ -14,12 +14,14 @@
  *   --ping    so testa o cabo: manda PING, espera PONG e sai (0 = ok)
  */
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/usbdevice_fs.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +29,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <termios.h>
@@ -37,6 +40,10 @@
 #define FRAME_RESPOSTA 2
 #define FRAME_PING     3
 #define FRAME_PONG     4
+#define FRAME_PEDIDO_PEDACOS 5
+#define FRAME_TAMANHO  6
+#define FRAME_LER      7
+#define FRAME_PEDACO   8
 
 #define HEADER_SIZE    10
 #define MAX_PAYLOAD    (4u * 1024 * 1024)
@@ -44,6 +51,15 @@
 #define RESPONSE_WAIT_MS 30000
 /* Sem resposta nesse prazo, o pedido e reenviado (quadro corrompido no cabo). */
 #define RETRY_MS         8000
+/* Respostas grandes vem em pedacos, um por vez, pedidos pela placa. */
+#define PEDACO_MAX       1024
+#define PEDACO_MIN       128
+#define PEDACO_WAIT_MS   400
+/* Pedaco que comecou a chegar e ficou esse tempo sem bytes novos: perdido. */
+#define PEDACO_GAP_MS    60
+/* Sem nenhum pedaco novo nesse prazo, desiste da resposta. */
+#define STALL_MS         15000
+#define OFFSET_DESCONHECIDO 0xFFFFFFFFu
 
 #define CP2102_VID     0x10c4
 #define CP2102_PID     0xea60
@@ -97,9 +113,18 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n)
 /* Leituras USB sempre na fila: o CP2102 so guarda 576 bytes recebidos e, a
  * 921600 baud, enche em ~6 ms. Com uma leitura sincrona por vez, o intervalo
  * entre elas perde dados em respostas grandes (os 21 KB de conquistas de um
- * jogo, por exemplo); com varias leituras enfileiradas, nunca ha intervalo. */
-#define IN_URBS     8
+ * jogo, por exemplo); com varias leituras enfileiradas, nunca ha intervalo.
+ * O CP2102 devolve o que tiver a cada consulta, entao uma leitura pode vir
+ * com poucos bytes: a fila e longa para aguentar o relay ficar sem CPU. */
+#define IN_URBS     32
 #define IN_URB_SIZE 512
+
+/* Contadores do pedido em andamento, para o log. */
+static struct
+{
+   unsigned long leituras, bytes_lidos, lixo;
+   int tentativas, pedacos, pedacos_repetidos;
+} st;
 
 struct link
 {
@@ -310,6 +335,8 @@ static ssize_t link_read(struct link *l, uint8_t *buf, size_t max, int timeout_m
             {
                memcpy(buf + n, u->buffer, u->actual_length);
                n += u->actual_length;
+               st.leituras++;
+               st.bytes_lidos += u->actual_length;
             }
             else if (u->status == -ENODEV || u->status == -ESHUTDOWN)
                return n ? (ssize_t)n : -1; /* CP2102 desconectado */
@@ -344,6 +371,8 @@ static ssize_t link_read(struct link *l, uint8_t *buf, size_t max, int timeout_m
       r = read(l->fd, buf, max);
       if (r < 0)
          return (errno == EAGAIN || errno == EINTR) ? 0 : -1;
+      st.leituras++;
+      st.bytes_lidos += (unsigned long)r;
       return r;
    }
 }
@@ -440,6 +469,7 @@ static int take_frame(uint8_t *type, uint16_t *id, uint8_t **data, uint32_t *len
       if (r < 0)
       {
          memmove(rx, rx + 1, --rx_len);
+         st.lixo++;
          continue;
       }
       if (r == 0)
@@ -454,6 +484,7 @@ static int take_frame(uint8_t *type, uint16_t *id, uint8_t **data, uint32_t *len
             return 0;
          memmove(rx, rx + j, rx_len - j);
          rx_len -= j;
+         st.lixo += j;
          continue;
       }
 
@@ -469,9 +500,10 @@ static int take_frame(uint8_t *type, uint16_t *id, uint8_t **data, uint32_t *len
    }
 }
 
-/* Espera um quadro do tipo e id pedidos ate o prazo. */
-static int wait_frame(struct link *l, uint8_t want_type, uint16_t want_id,
-      uint8_t **data, uint32_t *len, int timeout_ms)
+/* Espera, ate o prazo, um quadro com o id pedido e um dos tipos da mascara
+ * (bit 1 << tipo). 0 = recebido, -1 = prazo esgotado, -2 = cabo caiu. */
+static int wait_frame(struct link *l, unsigned types, uint16_t want_id,
+      uint8_t *got_type, uint8_t **data, uint32_t *len, int timeout_ms)
 {
    long long deadline = now_ms() + timeout_ms;
 
@@ -484,8 +516,12 @@ static int wait_frame(struct link *l, uint8_t want_type, uint16_t want_id,
 
       while (take_frame(&type, &id, data, len))
       {
-         if (type == want_type && id == want_id)
+         if (((1u << type) & types) && id == want_id)
+         {
+            if (got_type)
+               *got_type = type;
             return 0;
+         }
          free(*data); /* resposta atrasada de um pedido antigo */
       }
 
@@ -507,6 +543,145 @@ static int wait_frame(struct link *l, uint8_t want_type, uint16_t want_id,
          return -2;
       rx_len += (size_t)n;
    }
+}
+
+/* Leva um pedido HTTP pelo cabo e traz a resposta (0 = ok, -1 = sem resposta,
+ * -2 = cabo caiu). Resposta pequena vem num quadro so. A grande vem em
+ * pedacos que a placa pede um a um: nunca ha mais que PEDACO_MAX bytes a
+ * caminho, e um pedaco perdido e pedido de novo sozinho, sem repetir o resto.
+ * Com o jogo rodando, a placa perde bytes de rajadas longas (o controlador
+ * USB dessa porta depende da CPU), e uma resposta de 21 KB inteira nunca
+ * chegava sem erro. */
+static int transact(struct link *l, uint16_t id, const uint8_t *req, uint32_t req_len,
+      uint8_t **resp, uint32_t *resp_len)
+{
+   long long deadline = now_ms() + RESPONSE_WAIT_MS, progress;
+   uint8_t type, *data = NULL, *body;
+   uint32_t len, total, crc, off = 0, chunk = PEDACO_MAX;
+   int r = -1, streak = 0;
+
+   /* Reenvia com o mesmo id se a resposta nao vier: o Pi guarda as ultimas
+    * respostas e devolve a mesma, sem refazer a chamada. */
+   while (r == -1 && now_ms() < deadline)
+   {
+      long long left = deadline - now_ms();
+
+      st.tentativas++;
+      if (send_frame(l, FRAME_PEDIDO_PEDACOS, id, req, req_len) < 0)
+         return -2;
+      r = wait_frame(l, 1u << FRAME_RESPOSTA | 1u << FRAME_TAMANHO, id, &type,
+            &data, &len, left < RETRY_MS ? (int)left : RETRY_MS);
+   }
+   if (r != 0)
+      return r;
+   if (type == FRAME_RESPOSTA)
+   {
+      *resp     = data;
+      *resp_len = len;
+      return 0;
+   }
+
+   if (len != 8 || get_u32(data) > MAX_PAYLOAD)
+   {
+      free(data);
+      return -1;
+   }
+   total = get_u32(data);
+   crc   = get_u32(data + 4);
+   free(data);
+   body = malloc(total ? total : 1);
+
+   progress = now_ms();
+   while (off < total)
+   {
+      uint32_t want = total - off < chunk ? total - off : chunk;
+      uint8_t ler[6];
+      long long start;
+      unsigned long base;
+      int got = 0;
+
+      if (now_ms() - progress > STALL_MS)
+         break;
+      put_u32(ler, off);
+      put_u16(ler + 4, (uint16_t)want);
+      if (send_frame(l, FRAME_LER, id, ler, sizeof(ler)) < 0)
+      {
+         free(body);
+         return -2;
+      }
+      st.pedacos++;
+
+      /* Espera o pedaco desse offset; um pedaco repetido que chegou atrasado
+       * (de um LER anterior) e descartado. Se o pedaco comecou a chegar e
+       * parou, faltam bytes: pede de novo sem esperar o prazo inteiro. */
+      start = now_ms();
+      base  = st.bytes_lidos;
+      for (;;)
+      {
+         unsigned long before = st.bytes_lidos;
+         long long left = start + PEDACO_WAIT_MS - now_ms();
+
+         if (left <= 0)
+            break;
+         r = wait_frame(l, 1u << FRAME_PEDACO, id, NULL, &data, &len,
+               left < PEDACO_GAP_MS ? (int)left : PEDACO_GAP_MS);
+         if (r == -2)
+         {
+            free(body);
+            return -2;
+         }
+         if (r < 0)
+         {
+            if (st.bytes_lidos == before && st.bytes_lidos != base)
+               break;
+            continue;
+         }
+         if (len >= 4 && get_u32(data) == OFFSET_DESCONHECIDO)
+         {
+            /* O Pi nao tem mais essa resposta (reiniciou, por exemplo). */
+            free(data);
+            free(body);
+            return -1;
+         }
+         if (len == 4 + want && get_u32(data) == off)
+         {
+            memcpy(body + off, data + 4, want);
+            off += want;
+            progress = now_ms();
+            got = 1;
+            free(data);
+            break;
+         }
+         free(data);
+      }
+
+      /* Pedacos menores quando o cabo perde muito; volta a crescer depois
+       * de uma sequencia sem perdas. */
+      if (got)
+      {
+         if (++streak >= 8 && chunk < PEDACO_MAX)
+         {
+            chunk *= 2;
+            streak = 0;
+         }
+      }
+      else
+      {
+         st.pedacos_repetidos++;
+         streak = 0;
+         if (chunk > PEDACO_MIN)
+            chunk /= 2;
+      }
+   }
+
+   if (off < total || crc32_update(0, body, total) != crc)
+   {
+      free(body);
+      return -1;
+   }
+   *resp     = body;
+   *resp_len = total;
+   return 0;
 }
 
 /* --- HTTP local --------------------------------------------------------- */
@@ -564,6 +739,27 @@ static uint8_t *read_request(int c, size_t *out_len)
    return NULL;
 }
 
+/* O "r=" da API (login2, patch, awardachievement...) para o log; o resto do
+ * pedido tem a senha e o token, que nao vao para o log. */
+static void api_name(const uint8_t *req, size_t len, char *out, size_t size)
+{
+   size_t i, n = 0;
+
+   for (i = 0; i + 2 < len; i++)
+   {
+      if (req[i + 1] != 'r' || req[i + 2] != '='
+            || (req[i] != '?' && req[i] != '&' && req[i] != '\n'))
+         continue;
+      for (i += 3; i < len && n + 1 < size
+            && (isalnum(req[i]) || req[i] == '_'); i++)
+         out[n++] = (char)req[i];
+      break;
+   }
+   if (!n)
+      out[n++] = '-';
+   out[n] = '\0';
+}
+
 static volatile sig_atomic_t running = 1;
 static void on_signal(int s) { (void)s; running = 0; }
 
@@ -604,6 +800,18 @@ int main(int argc, char **argv)
       sigaction(SIGINT, &sa, NULL);
       sigaction(SIGTERM, &sa, NULL);
    }
+   {
+      /* Tempo real e memoria travada: o relay recolhe as leituras do USB
+       * assim que chegam, mesmo com o jogo ocupando a CPU, e nunca espera o
+       * pendrive para recarregar paginas do proprio binario. */
+      struct sched_param sp;
+      memset(&sp, 0, sizeof(sp));
+      sp.sched_priority = 10;
+      if (sched_setscheduler(0, SCHED_FIFO, &sp) < 0)
+         logmsg("sem prioridade de tempo real: %s", strerror(errno));
+      if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0)
+         logmsg("sem travar a memoria: %s", strerror(errno));
+   }
 
 #define OPEN_LINK() (tty ? link_open_tty(&l, tty, baud) : link_open_cp2102(&l, baud))
 
@@ -617,7 +825,7 @@ int main(int argc, char **argv)
          return 1;
       t0 = now_ms();
       if (send_frame(&l, FRAME_PING, next_id, NULL, 0) < 0
-            || wait_frame(&l, FRAME_PONG, next_id, &data, &len, 3000) < 0)
+            || wait_frame(&l, 1u << FRAME_PONG, next_id, NULL, &data, &len, 3000) < 0)
       {
          logmsg("PING sem resposta");
          return 1;
@@ -647,6 +855,8 @@ int main(int argc, char **argv)
       uint8_t *req, *resp = NULL;
       uint32_t resp_len = 0;
       size_t req_len;
+      char api[24];
+      long long t0;
       int c = accept(srv, NULL, NULL), r;
 
       if (c < 0)
@@ -663,41 +873,28 @@ int main(int argc, char **argv)
       if (l.fd < 0)
          OPEN_LINK();
 
-      /* Reenvia com o mesmo id se a resposta nao vier: o Pi guarda as
-       * ultimas respostas e devolve a mesma, sem refazer a chamada. */
-      r = -1;
-      {
-         long long deadline = now_ms() + RESPONSE_WAIT_MS;
-         int attempt;
-
-         for (attempt = 1; l.fd >= 0 && r == -1 && now_ms() < deadline; attempt++)
-         {
-            long long left = deadline - now_ms();
-            if (attempt > 1)
-               logmsg("pedido %u: reenviando (tentativa %d)", next_id, attempt);
-            if (send_frame(&l, FRAME_PEDIDO, next_id, req, (uint32_t)req_len) < 0)
-            {
-               r = -2;
-               break;
-            }
-            r = wait_frame(&l, FRAME_RESPOSTA, next_id, &resp, &resp_len,
-                  left < RETRY_MS ? (int)left : RETRY_MS);
-         }
-      }
+      memset(&st, 0, sizeof(st));
+      t0 = now_ms();
+      r  = l.fd >= 0 ? transact(&l, next_id, req, (uint32_t)req_len, &resp, &resp_len) : -2;
       if (r == -2)
          link_close(&l);
 
       if (r == 0)
          send(c, resp, resp_len, 0);
       else
-      {
-         logmsg("pedido %u sem resposta", next_id);
          send(c, RESPOSTA_502, sizeof(RESPOSTA_502) - 1, 0);
-      }
+      close(c);
+
+      /* O log vai para o pendrive, que e lento: so depois de responder. */
+      api_name(req, req_len, api, sizeof(api));
+      logmsg("pedido %u (%s): %s, %u bytes em %lld ms; tentativas %d, pedacos %d, "
+            "perdidos %d, lixo %lu B, %lu leituras (%lu B)",
+            next_id, api, r == 0 ? "ok" : "SEM RESPOSTA", r == 0 ? resp_len : 0,
+            now_ms() - t0, st.tentativas, st.pedacos, st.pedacos_repetidos,
+            st.lixo, st.leituras, st.bytes_lidos);
       next_id++;
       free(req);
       free(resp);
-      close(c);
    }
 
    link_close(&l);

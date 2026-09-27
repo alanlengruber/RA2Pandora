@@ -19,8 +19,12 @@ import tty
 import zlib
 
 PEDIDO, RESPOSTA, PING, PONG = 1, 2, 3, 4
+PEDIDO_PEDACOS, TAMANHO, LER, PEDACO = 5, 6, 7, 8
 HEADER = struct.Struct("<2sBBHI")  # magia, versao, tipo, id, tamanho
 MAX_PAYLOAD = 4 * 1024 * 1024
+# Respostas ate esse tamanho vao num quadro so, mesmo em PEDIDO_PEDACOS.
+PEDACO_MAX = 1024
+OFFSET_DESCONHECIDO = 0xFFFFFFFF
 
 API_HOST = "retroachievements.org"
 MEDIA_HOST = "media.retroachievements.org"
@@ -96,6 +100,11 @@ def extrair_quadros(buf):
     return quadros
 
 
+def escrever(fd, dados):
+    while dados:
+        dados = dados[os.write(fd, dados):]
+
+
 def resposta_http(status, motivo, corpo, tipo="text/plain"):
     cab = (f"HTTP/1.0 {status} {motivo}\r\nContent-Type: {tipo}\r\n"
            f"Content-Length: {len(corpo)}\r\nConnection: close\r\n\r\n")
@@ -146,8 +155,30 @@ def main():
     buf = bytearray()
     # Ultimas respostas, por (id, crc do pedido). A placa reenvia um pedido
     # quando a resposta se perde no cabo; o reenvio recebe a mesma resposta,
-    # sem refazer a chamada (uma conquista nao e enviada duas vezes).
+    # sem refazer a chamada (uma conquista nao e enviada duas vezes). Os
+    # pedacos de uma resposta grande tambem saem daqui.
     recentes = collections.OrderedDict()
+
+    def resposta_para(ident, conteudo):
+        chave = (ident, zlib.crc32(conteudo))
+        if chave in recentes:
+            log.info("pedido %d repetido: reenviando a resposta", ident)
+            recentes.move_to_end(chave)
+        else:
+            recentes[chave] = atender(conteudo)
+            while len(recentes) > 16:
+                recentes.popitem(last=False)
+        return recentes[chave]
+
+    def por_id(ident):
+        # A mais recente com esse id (o mesmo id pode sobrar de uma execucao
+        # anterior da placa; a do pedido atual acabou de ir para o fim).
+        for (i, _), resposta in reversed(recentes.items()):
+            if i == ident:
+                return resposta
+        return None
+
+    ultimo_ler = None
     while True:
         select.select([fd], [], [])
         buf += os.read(fd, 65536)
@@ -155,19 +186,28 @@ def main():
             del buf[:]
         for tipo, ident, conteudo in extrair_quadros(buf):
             if tipo == PING:
-                os.write(fd, montar_quadro(PONG, ident))
+                escrever(fd, montar_quadro(PONG, ident))
             elif tipo == PEDIDO:
-                chave = (ident, zlib.crc32(conteudo))
-                if chave in recentes:
-                    log.info("pedido %d repetido: reenviando a resposta", ident)
+                escrever(fd, montar_quadro(RESPOSTA, ident, resposta_para(ident, conteudo)))
+            elif tipo == PEDIDO_PEDACOS:
+                resposta = resposta_para(ident, conteudo)
+                if len(resposta) <= PEDACO_MAX:
+                    escrever(fd, montar_quadro(RESPOSTA, ident, resposta))
                 else:
-                    recentes[chave] = montar_quadro(RESPOSTA, ident, atender(conteudo))
-                    while len(recentes) > 16:
-                        recentes.popitem(last=False)
-                saida = recentes[chave]
-                while saida:
-                    n = os.write(fd, saida)
-                    saida = saida[n:]
+                    escrever(fd, montar_quadro(TAMANHO, ident, struct.pack(
+                        "<II", len(resposta), zlib.crc32(resposta))))
+            elif tipo == LER and len(conteudo) == 6:
+                offset, n = struct.unpack("<IH", conteudo)
+                resposta = por_id(ident)
+                if resposta is None or offset > len(resposta):
+                    log.warning("pedido %d: pedaco de uma resposta que nao existe mais", ident)
+                    escrever(fd, montar_quadro(PEDACO, ident, struct.pack("<I", OFFSET_DESCONHECIDO)))
+                    continue
+                if ultimo_ler == (ident, offset):
+                    log.info("pedido %d: pedaco %d pedido de novo", ident, offset // PEDACO_MAX)
+                ultimo_ler = (ident, offset)
+                escrever(fd, montar_quadro(PEDACO, ident,
+                                           struct.pack("<I", offset) + resposta[offset:offset + n]))
 
 
 if __name__ == "__main__":

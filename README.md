@@ -25,8 +25,7 @@ Tested on a single Pandora Box DX (Rockchip RK3128, Mali-400, 384x224 CRT output
 | RetroArch 1.22.2 + FBNeo on the board: full speed, sound, coins, controls, vertical games | working |
 | Games opened from the stock Pandory menu | working |
 | On-screen notifications | working |
-| Relay: board -> CP2102 -> Pi -> RetroAchievements (login) | working |
-| Large responses over the cable (a game's achievement set) | fix implemented (queued USB reads), awaiting hardware confirmation |
+| Relay: board -> CP2102 -> Pi -> RetroAchievements (login, achievement sets, unlocks) | working |
 
 The code comments and some script names are in Portuguese.
 
@@ -144,7 +143,8 @@ The password is stored in plain text on the drive.
 ## Troubleshooting
 
 - **Logs:** `pandora-ra/logs/retroarch.txt` (RetroArch), `relay.txt` (board side of the relay), `coin.txt`; on the Pi, `journalctl -u ra-relay`.
-- **Cable test:** run **TesteCabo** from the menu; it downloads a large RetroAchievements response three times over the cable and writes the result to `pandora-ra/logs/cabo.txt`. On the Pi, `sudo cat /proc/tty/driver/ttyAMA` shows the bytes received (`rx`) and sent (`tx`).
+- **Cable test:** run **TesteCabo** from the menu; it downloads a large RetroAchievements response (~67 KB) three times over the cable, then three more times with all four CPU cores busy (as in a game), and writes the result to `pandora-ra/logs/cabo.txt`. On the Pi, `sudo cat /proc/tty/driver/ttyAMA` shows the bytes received (`rx`) and sent (`tx`).
+- **Relay log:** each line of `relay.txt` is one request: the API call (`login2`, `patch`, `awardachievement`...), its size and time, and how many chunks had to be requested again. Passwords and tokens are never logged.
 - **Restart the board after running any script.** After a script from the Scripts entries, Pandory may keep launching that script instead of the next game you pick.
 - **ColetarLog** copies Pandory's own log (`/tmp/pandory.txt`) to `pandora-ra/logs-pandory/`.
 - **"Hardcore paused. Setting not allowed"** means a core option RetroAchievements forbids is on. `run.sh` already turns off FBNeo's patched romsets, the only one that is on by default.
@@ -156,6 +156,7 @@ The password is stored in plain text on the drive.
 - **Launcher:** Pandory always starts `/usr/bin/retroarch`, and passes only a placeholder where the ROM path should be (the real path is in `/tmp/retro_tmp`). `ra_trampolim` is a libretro core that reads the real path, checks it against `pandora-ra/jogos.txt` and `exec`s `pandora-ra/run.sh`.
 - **Coins:** the coin mechanism is read by the stock `emulotar` daemon, which bumps a counter in `/tmp/pipe1`. `pandora-coin` watches it and presses Select through RetroArch's Remote RetroPad (UDP on the loopback, which boots down on this board and is brought up by `run.sh`).
 - **Relay:** RetroArch's `cheevos_custom_host` points at `pandora-relay` on `127.0.0.1:8080`, which wraps each HTTP request in a CRC-checked frame and drives the CP2102 directly through usbfs (the board's kernel has no USB-serial drivers). Lost frames are resent; the Pi answers repeated requests from a cache, so an achievement is never submitted twice. See `tools/ra-relay/PROTOCOLO.md`.
+- **Large responses:** the CP2102 sits on the board's DWC2 USB port, whose transfers depend on the CPU; with a game running, long bursts from the Pi lose bytes (a 21 KB achievement set never arrived whole). So the board pulls large responses in chunks of up to 1 KB, one at a time, and asks again only for a chunk that went missing; chunks shrink while the cable is losing data. The relay also runs with real-time priority and locked memory, so the game cannot starve it.
 
 ## Credits and licenses
 
