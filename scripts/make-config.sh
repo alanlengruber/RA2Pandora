@@ -13,6 +13,7 @@ PATHS=$(cat <<EOF
 savefile_directory = "$RA/saves"
 savestate_directory = "$RA/states"
 system_directory = "$RA/system"
+assets_directory = "$RA/assets"
 playlist_directory = "$RA/playlists"
 cache_directory = "$RA/cache"
 rgui_config_directory = "$RA"

@@ -26,7 +26,8 @@ python3 "$ROOT/scripts/gerar-regras.py"
 python3 "$ROOT/scripts/gerar-atalhos.py"
 
 rm -rf "$P"
-mkdir -p "$P/pandora-ra/cores" "$P/pandora-ra/raspberry-pi" "$P/pandory/cores" "$P/roms_pandory/scripts"
+mkdir -p "$P/pandora-ra/cores" "$P/pandora-ra/raspberry-pi" "$P/pandora-ra/assets/sounds" \
+  "$P/pandory/cores" "$P/roms_pandory/scripts"
 
 install -m 755 "$ROOT/out/retroarch" "$ROOT/out/pandora-coin" "$ROOT/out/pandora-relay" "$P/pandora-ra/"
 install -m 644 "$ROOT/out/fbneo_libretro.so" "$P/pandora-ra/cores/"
@@ -34,6 +35,7 @@ D="$ROOT/deploy/pandora-ra"
 install -m 755 "$D/run.sh" "$P/pandora-ra/"
 install -m 644 "$D/retroarch.cfg" "$D/.asoundrc" "$D/vertical.cfg" "$D/verticais.txt" \
   "$D/jogos.txt" "$D/conta.cfg.exemplo" "$P/pandora-ra/"
+python3 "$ROOT/scripts/gerar-som-conquista.py" "$P/pandora-ra/assets/sounds/unlock.wav"
 # Lado do Raspberry Pi, para levar pelo pendrive.
 install -m 644 "$ROOT/tools/ra-relay/ra-relay-pi.py" "$ROOT/tools/ra-relay/instalar-pi.sh" \
   "$ROOT/tools/ra-relay/PROTOCOLO.md" "$P/pandora-ra/raspberry-pi/"
