@@ -36,102 +36,20 @@ The code comments and some script names are in Portuguese.
 - A **CP2102 USB-to-TTL adapter** (3.3 V logic, USB ID `10c4:ea60`) and 3 female-to-female jumper wires.
 - A **Raspberry Pi** with a GPIO UART and internet access (tested: Pi 3B with Raspberry Pi OS Lite, Debian 13).
 - A **RetroAchievements account**.
-- A **Linux** machine (or WSL) to build: `git`, `curl`, `python3`, `make`, `gcc`, `binutils` (`ar`), `pkg-config`.
+- A **Linux** machine (or WSL) to build: `git`, `curl`, `python3`, `make`, `gcc`, `binutils` (`ar`), `pkg-config`, `bzip2`, `xz-utils`.
 - **Arcade ROMs that match the current FBNeo romsets.** Most multi-game boards ship older sets (made for FBAlpha 2012 or MAME 2003); games whose sets do not match simply keep running on the stock emulator. No ROMs are included here.
 
-## 1. Get a copy of the board's system
+## Setup
 
-The build links against the board's own libraries (glibc 2.26, the Mali GPU driver, ALSA...), so it needs a copy of them.
+The full walkthrough, from the parts list to the first unlocked achievement, is in **[docs/setup-guide.md](docs/setup-guide.md)**. In short:
 
-1. Copy `deploy/roms_pandory/scripts/Diagnostico2.sh` to `roms_pandory/scripts/` on the board's USB drive.
-2. On the board, run **Diagnostico2** from the Scripts entries of the menu. The screen stays still; wait **several minutes, up to ~15** (the board writes slowly to the drive).
-3. When `diagnostico/concluido.txt` exists on the drive, copy `diagnostico/rootfs.tar.gz` to `sysroot/rootfs.tar.gz` in this repository.
-
-`Diagnostico2` only reads the board's system; it does not change anything on it.
-
-## 2. Build
-
-```sh
-scripts/preparar-ambiente.sh   # toolchain, sysroot, RetroArch v1.22.2 and FBNeo sources
-scripts/build-retroarch.sh     # out/retroarch (applies patches/retroarch automatically)
-scripts/build-fbneo.sh         # out/fbneo_libretro.so (takes a while)
-scripts/build-tools.sh         # out/pandora-coin, out/pandora-relay, out/ra_trampolim_libretro.so
-```
-
-The toolchain is Bootlin's `armv7-eabihf--glibc--stable-2018.02-2`: GCC 6.4 and glibc 2.26, the same versions as the board.
-
-## 3. Pick the games
-
-Only games that have official achievements **and** a romset compatible with the current FBNeo are sent to the new RetroArch; everything else stays on the stock emulator.
-
-```sh
-# From Linux, with the drive mounted:
-scripts/cruzar-roms.py --roms /path/to/drive/roms
-
-# Or on Windows, list the zips first (reads only the end of each zip):
-#   powershell -ExecutionPolicy Bypass -File scripts\listar-zips.ps1 -Dir H:\roms -Out zips.tsv
-scripts/cruzar-roms.py --zips zips.tsv
-```
-
-This writes `data/cruzamento-roms.tsv`: for every zip FBNeo knows, whether the set is complete (checked by CRC, including parent sets and BIOS), whether it has achievements, and whether it is vertical. On the tested drive: 3224 zips, 314 games with achievements and a compatible set.
-
-Then copy the **`pandory/pandory.xml` from your drive** to `deploy/pandory/pandory.xml.original`. RA2Pandora edits a copy of it: it adds `core="ra_trampolim"` to those 314 games and nothing else.
-
-## 4. Package and copy to the drive
-
-```sh
-scripts/montar-pacote.sh
-```
-
-This builds `pacote/` with the same layout as the drive's root. **Back up the drive first**, then copy the contents of `pacote/` to the drive's root:
-
-| Path on the drive | What it is |
-|---|---|
-| `pandora-ra/` | new RetroArch, FBNeo, relay, coin bridge, configuration; everything the new RetroArch writes (saves, logs) stays here |
-| `pandory/cores/ra_trampolim_libretro.so` | launcher core: the stock RetroArch loads it, and it hands the game over to the new one |
-| `pandory/pandory.xml` | your `pandory.xml` with the game rules (replaces the original: keep the backup) |
-| `roms_pandory/conquistas/` | one "(RA)" entry per game at the end of the menu list |
-| `roms_pandory/scripts/` | cable test and diagnostics |
-
-To undo everything, restore your original `pandory.xml` and delete these files.
-
-## 5. Wire the cable
-
-Plug the CP2102 into the board's free USB port and connect it to the Pi's GPIO header. Physical pin numbers: pin 1 is at the end of the header away from the USB ports, and even pins are on the row along the board's edge.
-
-| CP2102 | Raspberry Pi |
-|---|---|
-| TXD | pin 10 (GPIO15, RXD) |
-| RXD | pin 8 (GPIO14, TXD) |
-| GND | pin 6 (or any other GND pin) |
-| 3V3 / +5V | not connected |
-
-Pins 2 and 4 are 5 V: keep the wires away from them. If a case fan already uses pin 6, pick another GND pin (9 or 14).
-
-## 6. Set up the Raspberry Pi
-
-Copy `pandora-ra/raspberry-pi/` (or `tools/ra-relay/`) to the Pi and run:
-
-```sh
-sudo ./instalar-pi.sh
-sudo reboot
-```
-
-The installer frees the GPIO UART (on the Pi 3 it belongs to Bluetooth: it adds `dtoverlay=disable-bt`), removes the Linux serial console from it, and installs the relay as a systemd service that starts on boot. It keeps a `.antes-ra` backup of each system file it changes. Check it with `systemctl status ra-relay` and `journalctl -u ra-relay -f`.
-
-The relay needs no writes, so if the Pi shares the cabinet's power switch you can protect its SD card from power cuts with a read-only root:
-
-```sh
-sudo raspi-config nonint do_overlayfs 0 && sudo reboot   # 1 turns it off again
-```
-
-## 7. Log in to RetroAchievements
-
-Copy `pandora-ra/conta.cfg.exemplo` to `pandora-ra/conta.cfg` on the drive and fill in your account. Achievements stay off while this file does not exist.
-
-> **Use your original username.** If you renamed your RetroAchievements account, the login API still expects the name the account was created with; the new name is only the display name.
-
-The password is stored in plain text on the drive.
+1. Back up the board's USB drive.
+2. Run `Diagnostico2` on the board to copy its system libraries, then build RetroArch, FBNeo and the tools against them.
+3. Match your ROMs against the current FBNeo and RetroAchievements (`scripts/cruzar-roms.py`).
+4. Build the package (`scripts/montar-pacote.sh`) and copy it to the drive.
+5. Flash Raspberry Pi OS Lite on the Pi and run `instalar-pi.sh` on it.
+6. Wire the CP2102 to the Pi's UART pins.
+7. Add your RetroAchievements account in `pandora-ra/conta.cfg`, run the cable test and play.
 
 ## Playing
 

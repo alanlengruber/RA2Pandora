@@ -37,8 +37,8 @@ install -m 644 "$D/retroarch.cfg" "$D/.asoundrc" "$D/vertical.cfg" "$D/verticais
   "$D/jogos.txt" "$D/conta.cfg.exemplo" "$P/pandora-ra/"
 python3 "$ROOT/scripts/gerar-som-conquista.py" "$P/pandora-ra/assets/sounds/unlock.wav"
 # Lado do Raspberry Pi, para levar pelo pendrive.
-install -m 644 "$ROOT/tools/ra-relay/ra-relay-pi.py" "$ROOT/tools/ra-relay/instalar-pi.sh" \
-  "$ROOT/tools/ra-relay/PROTOCOLO.md" "$P/pandora-ra/raspberry-pi/"
+install -m 755 "$ROOT/tools/ra-relay/ra-relay-pi.py" "$ROOT/tools/ra-relay/instalar-pi.sh" "$P/pandora-ra/raspberry-pi/"
+install -m 644 "$ROOT/tools/ra-relay/PROTOCOLO.md" "$P/pandora-ra/raspberry-pi/"
 
 install -m 644 "$ROOT/out/ra_trampolim_libretro.so" "$P/pandory/cores/"
 install -m 644 "$ROOT/deploy/pandory/pandory.xml" "$P/pandory/"
